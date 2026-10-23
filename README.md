@@ -119,6 +119,31 @@ python main.py \
 ```
 *Note: This example is just used for illustrative purposes, as the ViT-H/14 config should be run on 16 A100 80G GPUs for an effective batch-size of 2048, in order to reproduce our results.*
 
+### Streaming ImageNet from Hugging Face
+The optional streaming backend uses the `datasets` package and the gated
+[`ILSVRC/imagenet-1k`](https://huggingface.co/datasets/ILSVRC/imagenet-1k)
+dataset. First request access and accept the ImageNet terms on the dataset
+page. Keep your Hugging Face token out of config files and source control; in
+the same shell used to launch training, enter it without echoing it:
+```
+read -rsp "Hugging Face token: " HF_TOKEN; echo; export HF_TOKEN
+```
+
+Use the sample ViT-S/16 config for a short pipeline smoke test (100 steps):
+```
+conda activate base
+python main.py --fname configs/in1k_vitsmall16_hf_stream.yaml --devices cuda:0
+```
+The sample config reads the `image` field and uses a batch size of 16. Its
+100 steps are only a smoke test, not a full ImageNet epoch. For one GPU and
+batch size 16, set `data.steps_per_epoch` to `80072` to consume the full
+1,281,167-image training split once. Adjust the step count for the per-GPU
+batch size and number of distributed ranks. The stream is shuffled and sharded
+across ranks and data-loader workers.
+
+If a token has been pasted into a chat or committed to a file, revoke it and
+create a replacement before training.
+
 ### Multi-GPU training
 In the multi-GPU setting, the implementation starts from [main_distributed.py](main_distributed.py), which, in addition to parsing the config file, also allows for specifying details about distributed training. For distributed training, we use the popular open-source [submitit](https://github.com/facebookincubator/submitit) tool and provide examples for a SLURM cluster.
 

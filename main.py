@@ -58,8 +58,17 @@ if __name__ == '__main__':
     num_gpus = len(args.devices)
     mp.set_start_method('spawn')
 
+    processes = []
     for rank in range(num_gpus):
-        mp.Process(
+        process = mp.Process(
             target=process_main,
             args=(rank, args.fname, num_gpus, args.devices)
-        ).start()
+        )
+        process.start()
+        processes.append(process)
+
+    for process in processes:
+        process.join()
+
+    if any(process.exitcode != 0 for process in processes):
+        raise SystemExit(1)

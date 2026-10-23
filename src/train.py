@@ -42,6 +42,7 @@ from src.utils.logging import (
     AverageMeter)
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
+from src.datasets.huggingface_stream import make_huggingface_stream
 
 from src.helper import (
     load_checkpoint,
@@ -93,8 +94,8 @@ def main(args, resume_preempt=False):
     batch_size = args['data']['batch_size']
     pin_mem = args['data']['pin_mem']
     num_workers = args['data']['num_workers']
-    root_path = args['data']['root_path']
-    image_folder = args['data']['image_folder']
+    root_path = args['data'].get('root_path')
+    image_folder = args['data'].get('image_folder')
     crop_size = args['data']['crop_size']
     crop_scale = args['data']['crop_scale']
     # --
@@ -125,6 +126,7 @@ def main(args, resume_preempt=False):
     folder = args['logging']['folder']
     tag = args['logging']['write_tag']
 
+    os.makedirs(folder, exist_ok=True)
     dump = os.path.join(folder, 'params-ijepa.yaml')
     with open(dump, 'w') as f:
         yaml.dump(args, f)
@@ -189,7 +191,27 @@ def main(args, resume_preempt=False):
         color_jitter=color_jitter)
 
     # -- init data-loaders/samplers
-    _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
+    dataset_backend = args['data'].get('dataset_backend', 'imagenet1k')
+    if dataset_backend == 'huggingface_stream':
+        steps_per_epoch = args['data']['steps_per_epoch']
+        _, unsupervised_loader, unsupervised_sampler = make_huggingface_stream(
+            transform=transform,
+            batch_size=batch_size,
+            collator=mask_collator,
+            pin_mem=pin_mem,
+            num_workers=num_workers,
+            world_size=world_size,
+            rank=rank,
+            dataset_name=args['data']['dataset_name'],
+            split=args['data'].get('split', 'train'),
+            image_key=args['data'].get('image_key', 'image'),
+            steps_per_epoch=steps_per_epoch,
+            config_name=args['data'].get('config_name'),
+            token_env=args['data'].get('token_env', 'HF_TOKEN'),
+            shuffle_buffer_size=args['data'].get('shuffle_buffer_size', 10000),
+        )
+    elif dataset_backend == 'imagenet1k':
+        _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
             transform=transform,
             batch_size=batch_size,
             collator=mask_collator,
@@ -202,6 +224,8 @@ def main(args, resume_preempt=False):
             image_folder=image_folder,
             copy_data=copy_data,
             drop_last=True)
+    else:
+        raise ValueError(f'Unsupported dataset backend: {dataset_backend}')
     ipe = len(unsupervised_loader)
 
     # -- init optimizer and scheduler
@@ -276,6 +300,8 @@ def main(args, resume_preempt=False):
         time_meter = AverageMeter()
 
         for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
+            if itr >= ipe:
+                break
 
             def load_imgs():
                 # -- unsupervised imgs

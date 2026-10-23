@@ -8,11 +8,11 @@ data:
   dataset_backend: huggingface_stream
   dataset_name: ILSVRC/imagenet-1k
   image_key: image
-  num_workers: 4
+  num_workers: 2
   pin_mem: true
   shuffle_buffer_size: 16
   split: train
-  steps_per_epoch: 100
+  steps_per_epoch: 10000
   token_env: HF_TOKEN
   use_color_distortion: false
   use_gaussian_blur: false

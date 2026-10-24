@@ -42,7 +42,10 @@ from src.utils.logging import (
     AverageMeter)
 from src.utils.tensors import repeat_interleave_batch
 from src.datasets.imagenet1k import make_imagenet1k
-from src.datasets.huggingface_stream import make_huggingface_stream
+from src.datasets.huggingface_stream import (
+    make_huggingface_multi_stream,
+    make_huggingface_stream,
+)
 
 from src.helper import (
     load_checkpoint,
@@ -194,22 +197,47 @@ def main(args, resume_preempt=False):
     dataset_backend = args['data'].get('dataset_backend', 'imagenet1k')
     if dataset_backend == 'huggingface_stream':
         steps_per_epoch = args['data']['steps_per_epoch']
-        _, unsupervised_loader, unsupervised_sampler = make_huggingface_stream(
-            transform=transform,
-            batch_size=batch_size,
-            collator=mask_collator,
-            pin_mem=pin_mem,
-            num_workers=num_workers,
-            world_size=world_size,
-            rank=rank,
-            dataset_name=args['data']['dataset_name'],
-            split=args['data'].get('split', 'train'),
-            image_key=args['data'].get('image_key', 'image'),
-            steps_per_epoch=steps_per_epoch,
-            config_name=args['data'].get('config_name'),
-            token_env=args['data'].get('token_env', 'HF_TOKEN'),
-            shuffle_buffer_size=args['data'].get('shuffle_buffer_size', 10000),
-        )
+        stream_sources = args['data'].get('streams')
+        if stream_sources:
+            _, unsupervised_loader, unsupervised_sampler = make_huggingface_multi_stream(
+                transform=transform,
+                batch_size=batch_size,
+                collator=mask_collator,
+                pin_mem=pin_mem,
+                num_workers=num_workers,
+                world_size=world_size,
+                rank=rank,
+                sources=stream_sources,
+                steps_per_epoch=steps_per_epoch,
+                token_env=args['data'].get('token_env', 'HF_TOKEN'),
+                shuffle_buffer_size=args['data'].get('shuffle_buffer_size', 1000),
+                max_skip_factor=args['data'].get('max_skip_factor', 50),
+            )
+        else:
+            _, unsupervised_loader, unsupervised_sampler = make_huggingface_stream(
+                transform=transform,
+                batch_size=batch_size,
+                collator=mask_collator,
+                pin_mem=pin_mem,
+                num_workers=num_workers,
+                world_size=world_size,
+                rank=rank,
+                dataset_name=args['data']['dataset_name'],
+                split=args['data'].get('split', 'train'),
+                image_key=args['data'].get('image_key', 'image'),
+                steps_per_epoch=steps_per_epoch,
+                config_name=args['data'].get('config_name'),
+                token_env=args['data'].get('token_env', 'HF_TOKEN'),
+                shuffle_buffer_size=args['data'].get('shuffle_buffer_size', 10000),
+                image_mode=args['data'].get('image_mode', 'pil'),
+                fallback_keys=args['data'].get('fallback_keys'),
+                url_timeout=args['data'].get('url_timeout', 5.0),
+                min_size=args['data'].get('min_size', 48),
+                columns=args['data'].get('columns'),
+                status_key=args['data'].get('status_key'),
+                status_allow=args['data'].get('status_allow'),
+                all_configs=args['data'].get('all_configs', False),
+            )
     elif dataset_backend == 'imagenet1k':
         _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
             transform=transform,

@@ -1,3 +1,4 @@
+import gc
 import io
 import logging
 import os
@@ -9,6 +10,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from PIL import Image, UnidentifiedImageError
 from torch.utils.data import get_worker_info
+
+logger = logging.getLogger(__name__)
 
 _GLOBAL_SEED = 0
 _DEFAULT_HEADERS = {
@@ -216,6 +219,9 @@ def _build_hf_stream(
 class _SourceState:
     __slots__ = (
         'name',
+        'spec',
+        'token',
+        'default_shuffle',
         'stream',
         'image_mode',
         'image_key',
@@ -229,6 +235,9 @@ class _SourceState:
 
     def __init__(self, spec: Dict[str, Any], token: Optional[str], default_shuffle: int):
         self.name = spec.get('name') or spec['dataset_name']
+        self.spec = spec
+        self.token = token
+        self.default_shuffle = default_shuffle
         self.image_mode = spec.get('image_mode', 'pil')
         self.image_key = spec.get('image_key', 'image')
         self.fallback_keys = list(spec.get('fallback_keys') or [])
@@ -238,18 +247,28 @@ class _SourceState:
         self.status_key = spec.get('status_key')
         allow = spec.get('status_allow')
         self.status_allow = list(allow) if allow is not None else None
+        self.stream = None
+
+    def ensure_stream(self, seed: Optional[int] = None):
+        if self.stream is not None:
+            return self.stream
+        spec = self.spec
         self.stream = _build_hf_stream(
             dataset_name=spec['dataset_name'],
             split=spec.get('split', 'train'),
-            token=token,
+            token=self.token,
             config_name=spec.get('config_name'),
             all_configs=bool(spec.get('all_configs', False)),
             columns=spec.get('columns'),
             shuffle_buffer_size=int(
-                spec.get('shuffle_buffer_size', default_shuffle)
+                spec.get('shuffle_buffer_size', self.default_shuffle)
             ),
-            seed=int(spec.get('seed', _GLOBAL_SEED)),
+            seed=int(spec.get('seed', seed if seed is not None else _GLOBAL_SEED)),
         )
+        return self.stream
+
+    def drop_stream(self):
+        self.stream = None
 
 
 class HuggingFaceImageStream(torch.utils.data.IterableDataset):
@@ -344,8 +363,32 @@ class HuggingFaceImageStream(torch.utils.data.IterableDataset):
             self.stream.set_epoch(epoch)
 
 
+def _allocate_quotas(total: int, weights: Sequence[float]) -> List[int]:
+    """Split `total` samples across sources proportional to weights."""
+    weight_sum = sum(weights)
+    if weight_sum <= 0 or total <= 0:
+        return [0] * len(weights)
+    raw = [total * (w / weight_sum) for w in weights]
+    quotas = [int(x) for x in raw]
+    leftover = total - sum(quotas)
+    # Give remaining samples to largest fractional remainders.
+    order = sorted(
+        range(len(weights)),
+        key=lambda i: (raw[i] - quotas[i], weights[i]),
+        reverse=True,
+    )
+    for i in order[:leftover]:
+        quotas[i] += 1
+    return quotas
+
+
 class HuggingFaceMultiImageStream(torch.utils.data.IterableDataset):
-    """Weighted multi-source HF stream with defective URL skipping."""
+    """Multi-source HF stream with defective URL skipping.
+
+    schedule:
+      - 'interleave': weighted random mix (all streams open; higher RAM)
+      - 'sequential': one source at a time; order shuffled each epoch (low RAM)
+    """
 
     def __init__(
         self,
@@ -358,11 +401,17 @@ class HuggingFaceMultiImageStream(torch.utils.data.IterableDataset):
         token_env='HF_TOKEN',
         shuffle_buffer_size=1000,
         max_skip_factor=50,
+        schedule='interleave',
     ):
         super().__init__()
         _quiet_http_worker(0)
         if not sources:
             raise ValueError('sources must be a non-empty list')
+        schedule = str(schedule).lower()
+        if schedule not in ('interleave', 'sequential'):
+            raise ValueError(
+                f"schedule must be 'interleave' or 'sequential', got {schedule!r}"
+            )
         token = os.environ.get(token_env)
         self.transform = transform
         self.steps_per_epoch = steps_per_epoch
@@ -370,6 +419,8 @@ class HuggingFaceMultiImageStream(torch.utils.data.IterableDataset):
         self.world_size = world_size
         self.rank = rank
         self.max_skip_factor = max_skip_factor
+        self.schedule = schedule
+        self.epoch = 0
         self.sources = [
             _SourceState(spec, token=token, default_shuffle=shuffle_buffer_size)
             for spec in sources
@@ -377,64 +428,160 @@ class HuggingFaceMultiImageStream(torch.utils.data.IterableDataset):
         self.weights = [max(src.weight, 0.0) for src in self.sources]
         if sum(self.weights) <= 0:
             raise ValueError('At least one stream weight must be > 0')
+        # Interleave needs every stream open; sequential builds lazily per source.
+        if self.schedule == 'interleave':
+            for source in self.sources:
+                source.ensure_stream()
 
-    def __iter__(self):
+    def _worker_plan(self):
         worker_info = get_worker_info()
         worker_count = worker_info.num_workers if worker_info else 1
         worker_id = worker_info.id if worker_info else 0
         sample_count = self.steps_per_epoch * self.batch_size
         samples_per_worker, remainder = divmod(sample_count, worker_count)
         worker_sample_count = samples_per_worker + (worker_id < remainder)
-
-        rng = random.Random(_GLOBAL_SEED + 1009 * self.rank + 17 * worker_id)
         shard_count = self.world_size * worker_count
         shard_index = self.rank * worker_count + worker_id
+        return worker_count, worker_id, worker_sample_count, shard_count, shard_index
+
+    def _sharded_iter(self, source: _SourceState, shard_count: int, shard_index: int):
+        stream = source.ensure_stream(seed=_GLOBAL_SEED + self.epoch)
+        if hasattr(stream, 'set_epoch'):
+            stream.set_epoch(self.epoch)
+        if shard_count > 1:
+            stream = stream.shard(num_shards=shard_count, index=shard_index)
+        return iter(stream)
+
+    def _extract_from_source(self, source: _SourceState, example: Dict[str, Any]):
+        return _extract_image(
+            example,
+            image_mode=source.image_mode,
+            image_key=source.image_key,
+            fallback_keys=source.fallback_keys,
+            url_timeout=source.url_timeout,
+            min_size=source.min_size,
+            status_key=source.status_key,
+            status_allow=source.status_allow,
+        )
+
+    def _iter_interleave(self):
+        _, worker_id, worker_sample_count, shard_count, shard_index = self._worker_plan()
+        rng = random.Random(
+            _GLOBAL_SEED + 1009 * self.rank + 17 * worker_id + 31 * self.epoch
+        )
 
         iterators = []
         for source in self.sources:
-            stream = source.stream
-            if shard_count > 1:
-                stream = stream.shard(num_shards=shard_count, index=shard_index)
-            iterators.append(iter(stream))
+            iterators.append(self._sharded_iter(source, shard_count, shard_index))
 
         yielded = 0
         attempts = 0
         max_attempts = max(worker_sample_count * self.max_skip_factor, worker_sample_count)
         while yielded < worker_sample_count and attempts < max_attempts:
             attempts += 1
-            source_index = rng.choices(range(len(self.sources)), weights=self.weights, k=1)[0]
+            source_index = rng.choices(
+                range(len(self.sources)), weights=self.weights, k=1
+            )[0]
             source = self.sources[source_index]
             try:
                 example = next(iterators[source_index])
             except StopIteration:
-                stream = source.stream
-                if shard_count > 1:
-                    stream = stream.shard(num_shards=shard_count, index=shard_index)
-                iterators[source_index] = iter(stream)
+                iterators[source_index] = self._sharded_iter(
+                    source, shard_count, shard_index
+                )
                 continue
 
-            image = _extract_image(
-                example,
-                image_mode=source.image_mode,
-                image_key=source.image_key,
-                fallback_keys=source.fallback_keys,
-                url_timeout=source.url_timeout,
-                min_size=source.min_size,
-                status_key=source.status_key,
-                status_allow=source.status_allow,
-            )
+            image = self._extract_from_source(source, example)
             if image is None:
                 continue
             yield self.transform(image), 0
             yielded += 1
 
+    def _iter_sequential(self):
+        """One HF source at a time; drop previous stream to keep RAM low."""
+        _, worker_id, worker_sample_count, shard_count, shard_index = self._worker_plan()
+        quotas = _allocate_quotas(worker_sample_count, self.weights)
+
+        order = list(range(len(self.sources)))
+        rng = random.Random(_GLOBAL_SEED + 7919 * self.epoch + 104729 * self.rank)
+        rng.shuffle(order)
+
+        if worker_id == 0 and self.rank == 0:
+            names = [self.sources[i].name for i in order if quotas[i] > 0]
+            logger.info(
+                'Sequential stream order for epoch %d: %s',
+                self.epoch,
+                ' -> '.join(names),
+            )
+
+        yielded = 0
+        for source_index in order:
+            quota = quotas[source_index]
+            if quota <= 0:
+                continue
+            source = self.sources[source_index]
+            # Drop every other stream so only the active source stays resident.
+            for other in self.sources:
+                if other is not source:
+                    other.drop_stream()
+            gc.collect()
+
+            if worker_id == 0 and self.rank == 0:
+                logger.info(
+                    'Streaming source %s (%d samples this worker)',
+                    source.name,
+                    quota,
+                )
+
+            iterator = self._sharded_iter(source, shard_count, shard_index)
+            taken = 0
+            attempts = 0
+            max_attempts = max(quota * self.max_skip_factor, quota)
+            while taken < quota and attempts < max_attempts:
+                attempts += 1
+                try:
+                    example = next(iterator)
+                except StopIteration:
+                    iterator = self._sharded_iter(source, shard_count, shard_index)
+                    continue
+                image = self._extract_from_source(source, example)
+                if image is None:
+                    continue
+                yield self.transform(image), 0
+                taken += 1
+                yielded += 1
+
+            source.drop_stream()
+            gc.collect()
+
+        if yielded < worker_sample_count:
+            logger.warning(
+                'Sequential stream ended early: got %d / %d samples '
+                '(rank=%d worker=%d epoch=%d)',
+                yielded,
+                worker_sample_count,
+                self.rank,
+                worker_id,
+                self.epoch,
+            )
+
+    def __iter__(self):
+        if self.schedule == 'sequential':
+            yield from self._iter_sequential()
+        else:
+            yield from self._iter_interleave()
+
     def __len__(self):
         return self.steps_per_epoch * self.batch_size
 
     def set_epoch(self, epoch):
+        self.epoch = int(epoch)
         for source in self.sources:
-            if hasattr(source.stream, 'set_epoch'):
-                source.stream.set_epoch(epoch)
+            if source.stream is not None and hasattr(source.stream, 'set_epoch'):
+                source.stream.set_epoch(self.epoch)
+            # Sequential rebuilds streams per source; clear so next iter is fresh.
+            if self.schedule == 'sequential':
+                source.drop_stream()
 
 
 def _make_loader(dataset, collator, batch_size, pin_mem, num_workers):
@@ -515,6 +662,7 @@ def make_huggingface_multi_stream(
     token_env='HF_TOKEN',
     shuffle_buffer_size=1000,
     max_skip_factor=50,
+    schedule='interleave',
 ):
     dataset = HuggingFaceMultiImageStream(
         sources=sources,
@@ -526,6 +674,7 @@ def make_huggingface_multi_stream(
         token_env=token_env,
         shuffle_buffer_size=shuffle_buffer_size,
         max_skip_factor=max_skip_factor,
+        schedule=schedule,
     )
     data_loader = _make_loader(
         dataset, collator, batch_size, pin_mem, num_workers

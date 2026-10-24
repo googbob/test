@@ -6,6 +6,9 @@ data:
   - 1.0
   crop_size: 224
   dataset_backend: huggingface_stream
+  # sequential = one HF source open at a time (low RAM); order reshuffled each epoch
+  # interleave = weighted mix of all sources at once (higher RAM)
+  stream_schedule: sequential
   max_skip_factor: 50
   num_workers: 1
   pin_mem: true

@@ -212,6 +212,7 @@ def main(args, resume_preempt=False):
                 token_env=args['data'].get('token_env', 'HF_TOKEN'),
                 shuffle_buffer_size=args['data'].get('shuffle_buffer_size', 1000),
                 max_skip_factor=args['data'].get('max_skip_factor', 50),
+                schedule=args['data'].get('stream_schedule', 'interleave'),
             )
         else:
             _, unsupervised_loader, unsupervised_sampler = make_huggingface_stream(

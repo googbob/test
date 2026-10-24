@@ -8,6 +8,7 @@ from torch.utils.data import get_worker_info
 
 def _quiet_http_worker(worker_id):
     logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('httpx2').setLevel(logging.WARNING)
     logging.getLogger('httpcore').setLevel(logging.WARNING)
 
 
@@ -28,8 +29,7 @@ class HuggingFaceImageStream(torch.utils.data.IterableDataset):
         shuffle_buffer_size=10000,
     ):
         super().__init__()
-        logging.getLogger('httpx').setLevel(logging.WARNING)
-        logging.getLogger('httpcore').setLevel(logging.WARNING)
+        _quiet_http_worker(0)
         try:
             from datasets import load_dataset
         except ImportError as exc:

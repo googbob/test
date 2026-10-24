@@ -23,7 +23,6 @@ import sys
 import yaml
 
 import numpy as np
-from tqdm import tqdm
 
 import torch
 import torch.multiprocessing as mp
@@ -300,15 +299,7 @@ def main(args, resume_preempt=False):
         maskB_meter = AverageMeter()
         time_meter = AverageMeter()
 
-        progress = tqdm(
-            unsupervised_loader,
-            total=ipe,
-            desc=f'Epoch {epoch + 1}/{num_epochs}',
-            unit='step',
-            dynamic_ncols=True,
-            disable=rank != 0,
-        )
-        for itr, (udata, masks_enc, masks_pred) in enumerate(progress):
+        for itr, (udata, masks_enc, masks_pred) in enumerate(unsupervised_loader):
             if itr >= ipe:
                 break
 
@@ -374,40 +365,32 @@ def main(args, resume_preempt=False):
             (loss, _new_lr, _new_wd, grad_stats), etime = gpu_timer(train_step)
             loss_meter.update(loss)
             time_meter.update(etime)
-            memory_mb = torch.cuda.max_memory_allocated() / 1024.**2 if torch.cuda.is_available() else 0
-            progress.set_postfix(
-                loss=f'{loss_meter.avg:.4f}',
-                lr=f'{_new_lr:.2e}',
-                wd=f'{_new_wd:.2e}',
-                mem=f'{memory_mb:.0f}MB',
-                refresh=False,
-            )
 
             # -- Logging
             def log_stats():
                 csv_logger.log(epoch + 1, itr, loss, maskA_meter.val, maskB_meter.val, etime)
                 if (itr % log_freq == 0) or np.isnan(loss) or np.isinf(loss):
-                    tqdm.write('[%d, %5d] loss: %.3f '
-                               'masks: %.1f %.1f '
-                               '[wd: %.2e] [lr: %.2e] '
-                               '[mem: %.2e] '
-                               '(%.1f ms)'
-                               % (epoch + 1, itr,
-                                  loss_meter.avg,
-                                  maskA_meter.avg,
-                                  maskB_meter.avg,
-                                  _new_wd,
-                                  _new_lr,
-                                  memory_mb,
-                                  time_meter.avg))
+                    logger.info('[%d, %5d] loss: %.3f '
+                                'masks: %.1f %.1f '
+                                '[wd: %.2e] [lr: %.2e] '
+                                '[mem: %.2e] '
+                                '(%.1f ms)'
+                                % (epoch + 1, itr,
+                                   loss_meter.avg,
+                                   maskA_meter.avg,
+                                   maskB_meter.avg,
+                                   _new_wd,
+                                   _new_lr,
+                                   torch.cuda.max_memory_allocated() / 1024.**2,
+                                   time_meter.avg))
 
                     if grad_stats is not None:
-                        tqdm.write('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
-                                   % (epoch + 1, itr,
-                                      grad_stats.first_layer,
-                                      grad_stats.last_layer,
-                                      grad_stats.min,
-                                      grad_stats.max))
+                        logger.info('[%d, %5d] grad_stats: [%.2e %.2e] (%.2e, %.2e)'
+                                    % (epoch + 1, itr,
+                                       grad_stats.first_layer,
+                                       grad_stats.last_layer,
+                                       grad_stats.min,
+                                       grad_stats.max))
 
             log_stats()
 

@@ -1,5 +1,5 @@
 data:
-  batch_size: 64
+  batch_size: 1024
   color_jitter_strength: 0.0
   crop_scale:
   - 0.3
@@ -8,11 +8,11 @@ data:
   dataset_backend: huggingface_stream
   dataset_name: ILSVRC/imagenet-1k
   image_key: image
-  num_workers: 2
+  num_workers: 8
   pin_mem: true
-  shuffle_buffer_size: 16
+  shuffle_buffer_size: 1024
   split: train
-  steps_per_epoch: 30000
+  steps_per_epoch: 1500
   token_env: HF_TOKEN
   use_color_distortion: true
   use_gaussian_blur: true
